@@ -79,10 +79,12 @@ def extract_cves(url: str, token: str, scan_id: int) -> dict:
     hosts_raw = scan_data.get("hosts") or []
     hosts_out = []
     for h in hosts_raw:
+        ip = h.get("hostname", "")
         hosts_out.append({
             "host_id": h["host_id"],
-            "ip": h.get("hostname", ""),
-            "hostname": h.get("hostname", ""),
+            "ip": ip,
+            "hostname": ip,
+            "name": h.get("name") or ip,
             "critical": h.get("critical", 0),
             "high": h.get("high", 0),
             "medium": h.get("medium", 0),
@@ -134,7 +136,14 @@ def extract_cves(url: str, token: str, scan_id: int) -> dict:
                 cve_map[cve]["plugin_ids"].append(pid)
 
     cves_list = sorted(cve_map.values(), key=lambda x: (-x["severity_int"], x["cve_id"]))
-    all_ips = list({h["ip"] for h in hosts_out if h["ip"]})
+    seen_ips: set = set()
+    all_ips: list = []
+    all_hosts: list = []
+    for h in hosts_out:
+        if h["ip"] and h["ip"] not in seen_ips:
+            seen_ips.add(h["ip"])
+            all_ips.append(h["ip"])
+            all_hosts.append({"ip": h["ip"], "name": h["name"]})
 
     return {
         "hosts": hosts_out,
@@ -142,4 +151,5 @@ def extract_cves(url: str, token: str, scan_id: int) -> dict:
         "total_hosts": len(hosts_out),
         "total_cves": len(cves_list),
         "all_ips": all_ips,
+        "all_hosts": all_hosts,
     }
