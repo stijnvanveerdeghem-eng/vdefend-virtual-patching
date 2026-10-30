@@ -95,6 +95,33 @@ def connect(url: str, username: str, password: str) -> dict:
     }
 
 
+_TLS_DISPLAY = {
+    "TLS_V10": "TLS 1.0", "TLS_V11": "TLS 1.1",
+    "TLS_V12": "TLS 1.2", "TLS_V13": "TLS 1.3",
+}
+
+
+def get_app_id_index(url: str, username: str, password: str) -> dict:
+    """Return {appId: short_label} for all 5000+ NSX DPI application IDs.
+
+    Uses GET /policy/api/v1/infra/context-profiles/attributes?attribute_key=APP_ID
+    (NSX 9.1 renamed the endpoint from attribute-values to attributes).
+    The app ID itself is the short name; TLS versions get "TLS 1.x" overrides.
+    """
+    url = _clean_url(url)
+    data = _req(
+        f"{url}{POLICY}/infra/context-profiles/attributes?attribute_key=APP_ID",
+        username=username, password=password,
+    )
+    result = {}
+    for attr in (data.get("results") or [{}])[0].get("attributes", []):
+        val = (attr.get("value") or [None])[0]
+        if not val:
+            continue
+        result[val] = _TLS_DISPLAY.get(val, val)
+    return result
+
+
 def get_active_signature_version(url: str, username: str, password: str) -> str:
     url = _clean_url(url)
     endpoint = f"{url}{POLICY}/infra/settings/firewall/security/intrusion-services/signature-versions"
@@ -183,22 +210,33 @@ def index_signatures(url: str, username: str, password: str, cve_list: list) -> 
             print(f"Error fetching batch: {e}")
 
     matched_cves = {k: v for k, v in cve_to_sigs.items() if v}
+    unique_sig_ids = {str(sig["sig_id"]) for sigs in matched_cves.values()
+                      for sig in sigs if sig.get("sig_id")}
     return {
         "total_signatures": total_signatures,
         "matched_cves": matched_cves,
         "coverage_count": len(matched_cves),
         "total_cves_requested": len(cve_list),
         "total_signatures_matched": sum(len(v) for v in matched_cves.values()),
+        "unique_signatures": len(unique_sig_ids),
     }
 
 
 _IP_RE = __import__("re").compile(r"^\d{1,3}(\.\d{1,3}){3}$")
 
-def tag_vm_by_ip(url: str, username: str, password: str, ip_address: str, cve_list: list):
+def tag_vm_by_ip(url: str, username: str, password: str, ip_address: str, cve_list: list, extra_tags: list = None):
     url = _clean_url(url)
 
-    def _vif_lookup(ip):
-        """Walk fabric VIFs — IPs are nested in ip_address_info[].ip_addresses[]."""
+    def _policy_search(ip):
+        """Search policy index for VirtualMachine by IP — works across all NSX 9.x versions."""
+        query = urllib.parse.quote(f"resource_type:VirtualMachine AND ip_addresses:{ip}")
+        res = _req(f"{url}{POLICY}/search/query?query={query}&page_size=10",
+                   username=username, password=password)
+        results = (res or {}).get("results", [])
+        return results[0].get("external_id") if results else None
+
+    def _vif_pagination(ip):
+        """Walk all fabric VIFs and inspect ip_address_info — slower but broadly compatible."""
         cursor = None
         while True:
             qs = f"page_size=500{f'&cursor={urllib.parse.quote(cursor)}' if cursor else ''}"
@@ -223,7 +261,9 @@ def tag_vm_by_ip(url: str, username: str, password: str, ip_address: str, cve_li
     is_ip = bool(_IP_RE.match(ip_address))
     short_name = ip_address.split(".")[0] if not is_ip else None
 
-    vm_id = _vif_lookup(ip_address)
+    vm_id = _policy_search(ip_address) if is_ip else None
+    if not vm_id:
+        vm_id = _vif_pagination(ip_address)
     if not vm_id and short_name:
         vm_id = _name_search(short_name)
 
@@ -234,6 +274,8 @@ def tag_vm_by_ip(url: str, username: str, password: str, ip_address: str, cve_li
     print(f"Found VM {vm_id} for {ip_address}. Applying tags...")
 
     tags = [{"scope": "Vulnerability", "tag": cve} for cve in cve_list[:30]]
+    if extra_tags:
+        tags.extend(extra_tags)
     _req(f"{url}/api/v1/fabric/virtual-machines?action=add_tags",
          method="POST", body={"external_id": vm_id, "tags": tags},
          username=username, password=password)
@@ -241,28 +283,16 @@ def tag_vm_by_ip(url: str, username: str, password: str, ip_address: str, cve_li
     return {"tagged": True, "ip": ip_address, "vm_id": vm_id}
 
 
-def create_group(url: str, username: str, password: str, run_id: str, cve_list: list) -> dict:
+def create_ip_group(url: str, username: str, password: str,
+                    group_id: str, group_name: str, ip_list: list) -> dict:
+    """Create/update a static IP-address-based NSX group."""
     url = _clean_url(url)
-    group_name = cve_list[0] if len(cve_list) == 1 else "VirtualPatch-Multiple-CVEs"
-    # Stable ID so re-deploys update the same group rather than creating new ones
-    group_id = "virtualPatch-" + "-".join(sorted(c.upper().replace("CVE-", "") for c in cve_list))
-
-    expressions = []
-    for i, cve in enumerate(cve_list):
-        expr = {
-            "resource_type": "Condition",
-            "member_type": "VirtualMachine",
-            "key": "Tag",
-            "operator": "EQUALS",
-            "value": f"Vulnerability|{cve}"
-        }
-        expressions.append(expr)
-        if i < len(cve_list) - 1:
-            expressions.append({"resource_type": "ConjunctionOperator", "conjunction_operator": "OR"})
-
     body = {
         "display_name": group_name,
-        "expression": expressions,
+        "expression": [{
+            "resource_type": "IPAddressExpression",
+            "ip_addresses": ip_list,
+        }],
     }
     endpoint = f"{url}{POLICY}/infra/domains/default/groups/{group_id}"
     try:
@@ -271,6 +301,107 @@ def create_group(url: str, username: str, password: str, run_id: str, cve_list: 
     except Exception:
         method = "PUT"
     _req(endpoint, method=method, body=body, username=username, password=password)
+    return {
+        "group_id": group_id,
+        "group_path": f"/infra/domains/default/groups/{group_id}",
+        "group_name": group_name,
+    }
+
+
+def create_group(url: str, username: str, password: str, run_id: str, cve_list: list,
+                 group_name: str = "", port: str = "", proto: str = "") -> dict:
+    """Create/update a tag-based NSX group.
+
+    Without port: expression is (CVE-1 OR CVE-2 ...) matching Vulnerability scope.
+    With port: expression is (CVE-1 OR CVE-2 ...) AND DestPort:TCPxxx using a
+    NestedExpression so the OR precedence is correct before the AND.
+    VMs must be tagged with both Vulnerability:CVE-xxx and DestPort:TCPxxx tags
+    for per-port group membership to work.
+    """
+    url = _clean_url(url)
+    if not group_name:
+        group_name = cve_list[0] if len(cve_list) == 1 else "VirtualPatch-Multiple-CVEs"
+    cve_slug = "-".join(sorted(c.upper().replace("CVE-", "") for c in cve_list))
+    proto_upper = (proto or "TCP").upper()
+    # Support comma-delimited ports: "80,443" → ["80", "443"]
+    port_list = [p.strip() for p in port.split(",") if p.strip()] if port else []
+    port_slug = ("_" + "-".join(f"{proto_upper}{p}" for p in port_list)) if port_list else ""
+    group_id = f"virtualPatch-{cve_slug}{port_slug}"
+
+    # Build CVE OR conditions (used when no port is given)
+    cve_conditions = []
+    for i, cve in enumerate(cve_list):
+        cve_conditions.append({
+            "resource_type": "Condition",
+            "member_type": "VirtualMachine",
+            "key": "Tag",
+            "operator": "EQUALS",
+            "value": f"Vulnerability|{cve}",
+        })
+        if i < len(cve_list) - 1:
+            cve_conditions.append({"resource_type": "ConjunctionOperator", "conjunction_operator": "OR"})
+
+    if port_list:
+        # NSX only allows AND inside NestedExpression; flat arrays use AND-before-OR.
+        # Solution: one NestedExpression per (CVE × port) pair, OR'd at the top level.
+        # Max 5 criteria supported by NSX — (CVEs × ports) must stay ≤ 5.
+        pairs = [(cve, f"{proto_upper}{p}") for cve in cve_list for p in port_list]
+        if len(pairs) == 1:
+            # Single CVE + single port: flat AND, no nesting needed
+            cve, dest_port_tag = pairs[0]
+            expressions = [
+                {
+                    "resource_type": "Condition",
+                    "member_type": "VirtualMachine",
+                    "key": "Tag",
+                    "operator": "EQUALS",
+                    "value": f"Vulnerability|{cve}",
+                },
+                {"resource_type": "ConjunctionOperator", "conjunction_operator": "AND"},
+                {
+                    "resource_type": "Condition",
+                    "member_type": "VirtualMachine",
+                    "key": "Tag",
+                    "operator": "EQUALS",
+                    "value": f"DestPort|{dest_port_tag}",
+                },
+            ]
+        else:
+            expressions = []
+            for i, (cve, dest_port_tag) in enumerate(pairs):
+                if i > 0:
+                    expressions.append({"resource_type": "ConjunctionOperator", "conjunction_operator": "OR"})
+                expressions.append({
+                    "resource_type": "NestedExpression",
+                    "expressions": [
+                        {
+                            "resource_type": "Condition",
+                            "member_type": "VirtualMachine",
+                            "key": "Tag",
+                            "operator": "EQUALS",
+                            "value": f"Vulnerability|{cve}",
+                        },
+                        {"resource_type": "ConjunctionOperator", "conjunction_operator": "AND"},
+                        {
+                            "resource_type": "Condition",
+                            "member_type": "VirtualMachine",
+                            "key": "Tag",
+                            "operator": "EQUALS",
+                            "value": f"DestPort|{dest_port_tag}",
+                        },
+                    ],
+                })
+    else:
+        expressions = cve_conditions
+
+    body = {
+        "display_name": group_name,
+        "expression": expressions,
+    }
+    endpoint = f"{url}{POLICY}/infra/domains/default/groups/{group_id}"
+    # NSX Policy PATCH is a declarative upsert — creates or fully replaces.
+    # PUT rejects existing objects with 400, so always use PATCH.
+    _req(endpoint, method="PATCH", body=body, username=username, password=password)
     return {"group_id": group_id, "group_path": f"/infra/domains/default/groups/{group_id}", "group_name": group_name}
 
 
@@ -437,40 +568,54 @@ def create_profile(
         }
 
     else:
-        # Modern NSX (9.1+): CVE criteria filter handles scoping cleanly.
-        # In DETECT_PREVENT mode, escalate any ALERT signatures to REJECT.
-        # In DETECT mode, no overrides — rule-level DETECT makes everything alert-only.
-        profile_id = f"virtualPatch-profile-{run_id}"
-        nsx_cves = [cve[4:] if cve.startswith("CVE-") else cve for cve in matched_cves.keys()]
+        # Modern NSX (9.1+): include all system signatures at all severities, then
+        # explicitly enable and set action for each CVE-matched signature via overrides.
+        # NSX's CVE criteria filter does not reliably match non-standard CVE numbers
+        # (e.g. 6-digit NNNNNNs like 2026-109618), so we skip criteria and use the
+        # IDS rule's scope (destination groups) to provide targeting instead.
+        profile_id = _profile_id_for_cves(list(matched_cves.keys()))
 
+        seen: set = set()
         overrides = []
-        if rule_action == "DETECT_PREVENT":
-            seen: set = set()
-            for sigs in matched_cves.values():
-                for sig in sigs:
-                    sid = sig.get("sig_id")
-                    if sid and sid not in seen and _should_escalate(sig.get("action", "")):
-                        seen.add(sid)
-                        overrides.append({"signature_id": sid, "action": "REJECT"})
+        for sigs in matched_cves.values():
+            for sig in sigs:
+                sid = sig.get("sig_id")
+                if not sid or sid in seen:
+                    continue
+                seen.add(sid)
+                if rule_action == "DETECT_PREVENT" and _should_escalate(sig.get("action", "")):
+                    overrides.append({"signature_id": sid, "enable": True, "action": "REJECT"})
+                # else: include_system_signatures:true already enables at default action; no override needed
+
+        profile_endpoint = f"{url}{POLICY}/infra/settings/firewall/security/intrusion-services/profiles/{profile_id}"
+        existing_overrides_by_sid: dict = {}
+        method = "PUT"
+        try:
+            existing = _req(profile_endpoint, username=username, password=password)
+            method = "PATCH"
+            # Preserve existing overrides (e.g. manually added sigs lacking CVE enrichment)
+            for entry in existing.get("overridden_signatures", []):
+                sid = str(entry.get("signature_id", ""))
+                if sid:
+                    existing_overrides_by_sid[sid] = entry
+            print(f"Profile {profile_id} exists ({len(existing_overrides_by_sid)} existing overrides) — merging")
+        except Exception:
+            print(f"Profile {profile_id} not found — creating")
+
+        # Our CVE-derived overrides take precedence; unknown existing ones are kept as-is
+        merged: dict = {**existing_overrides_by_sid}
+        for o in overrides:
+            merged[str(o["signature_id"])] = o
 
         body = {
             "display_name": profile_name,
-            "criteria": [
-                {
-                    "resource_type": "IdsProfileFilterCriteria",
-                    "filter_name": "CVE",
-                    "filter_value": nsx_cves,
-                }
-            ],
-            "overridden_signatures": overrides,
-            "profile_severity": ["CRITICAL", "HIGH", "MEDIUM", "LOW"],
+            "criteria": [],
+            "overridden_signatures": list(merged.values()),
+            "profile_severity": ["CRITICAL", "HIGH", "MEDIUM", "LOW", "SUSPICIOUS"],
             "include_system_signatures": True,
             "include_custom_signatures": False,
         }
-        _req(
-            f"{url}{POLICY}/infra/settings/firewall/security/intrusion-services/profiles/{profile_id}",
-            method="PUT", body=body, username=username, password=password,
-        )
+        _req(profile_endpoint, method=method, body=body, username=username, password=password)
         return {
             "profile_id": profile_id,
             "profile_path": f"/infra/settings/firewall/security/intrusion-services/profiles/{profile_id}",
@@ -479,44 +624,85 @@ def create_profile(
         }
 
 
-def _resolve_service(url: str, username: str, password: str,
-                     protocol: str, port: str) -> str:
-    """Return the path of an NSX service matching protocol/port.
+# Well-known NSX built-in service IDs for common single ports
+_BUILTIN_SERVICES = {
+    ("TCP", "80"):   "HTTP",
+    ("TCP", "443"):  "HTTPS",
+    ("TCP", "8080"): "HTTP-ALT",
+    ("TCP", "8443"): "HTTPS-ALT",
+    ("TCP", "22"):   "SSH",
+    ("TCP", "3389"): "RDP",
+    ("TCP", "3306"): "MySQL",
+    ("TCP", "1433"): "MS-SQL",
+    ("TCP", "53"):   "DNS",
+    ("UDP", "53"):   "DNS",
+}
 
-    Searches all existing services first (built-in and custom). Only creates
-    a new vp- service if no existing service matches.
+
+def _resolve_service(url: str, username: str, password: str,
+                     protocol: str, ports: list) -> str:
+    """Return the path of an NSX service matching protocol/ports.
+
+    For a single port, tries the well-known built-in service ID first (fast
+    direct GET), then falls back to a full pagination search, then creates a
+    custom vp- service. For multiple ports, always creates/updates a custom
+    vp- service with all ports in one L4 entry.
     """
     proto = protocol.upper()
-    port_str = str(port)
+    port_strs = [str(p) for p in ports]
 
-    # Walk all services looking for an L4 entry that matches
-    cursor = None
-    while True:
-        qs = f"page_size=1000{f'&cursor={urllib.parse.quote(cursor)}' if cursor else ''}"
-        res = _req(f"{url}{POLICY}/infra/services?{qs}", username=username, password=password)
-        for svc in (res or {}).get("results", []):
-            for entry in svc.get("service_entries", []):
-                if (entry.get("resource_type") == "L4PortSetServiceEntry"
-                        and entry.get("l4_protocol", "").upper() == proto
-                        and port_str in [str(p) for p in entry.get("destination_ports", [])]):
-                    path = svc.get("path") or f"/infra/services/{svc['id']}"
-                    print(f"Found existing service {svc['id']} for {proto} {port_str}")
-                    return path
-        cursor = (res or {}).get("cursor")
-        if not cursor:
-            break
+    if len(port_strs) == 1:
+        port_str = port_strs[0]
 
-    # No existing service matched — create a custom one
-    service_id = f"{proto.lower()}-{port_str}"
-    print(f"Creating service {service_id} ({proto} {port_str})")
+        # Fast path: try well-known built-in service ID directly
+        builtin_id = _BUILTIN_SERVICES.get((proto, port_str))
+        if builtin_id:
+            try:
+                svc = _req(f"{url}{POLICY}/infra/services/{builtin_id}",
+                           username=username, password=password)
+                for entry in svc.get("service_entries", []):
+                    if (entry.get("resource_type") == "L4PortSetServiceEntry"
+                            and entry.get("l4_protocol", "").upper() == proto
+                            and port_str in [str(p) for p in entry.get("destination_ports", [])]):
+                        path = svc.get("path") or f"/infra/services/{builtin_id}"
+                        print(f"Using built-in service {builtin_id} for {proto}:{port_str}")
+                        return path
+            except Exception:
+                pass  # not found or doesn't match — fall through
+
+        # Slow path: paginate through all services
+        cursor = None
+        while True:
+            qs = f"page_size=1000{f'&cursor={urllib.parse.quote(cursor)}' if cursor else ''}"
+            res = _req(f"{url}{POLICY}/infra/services?{qs}", username=username, password=password)
+            for svc in (res or {}).get("results", []):
+                for entry in svc.get("service_entries", []):
+                    if (entry.get("resource_type") == "L4PortSetServiceEntry"
+                            and entry.get("l4_protocol", "").upper() == proto
+                            and port_str in [str(p) for p in entry.get("destination_ports", [])]):
+                        path = svc.get("path") or f"/infra/services/{svc['id']}"
+                        print(f"Found existing service {svc['id']} for {proto}:{port_str}")
+                        return path
+            cursor = (res or {}).get("cursor")
+            if not cursor:
+                break
+
+    # Multiple ports, or no match found — create/update a custom vp- service
+    try:
+        slug = "-".join(sorted(port_strs, key=int))
+    except ValueError:
+        slug = "-".join(sorted(port_strs))
+    service_id = f"vp-{proto.lower()}-{slug}"
+    display = f"{proto} {', '.join(sorted(port_strs, key=lambda p: int(p) if p.isdigit() else 0))}"
+    print(f"Creating/updating service {service_id} ({display})")
     _req(f"{url}{POLICY}/infra/services/{service_id}",
          method="PATCH", username=username, password=password, body={
-             "display_name": f"{proto} {port_str}",
+             "display_name": display,
              "service_entries": [{
-                 "id": f"port-{port_str}",
+                 "id": f"ports-{slug}",
                  "resource_type": "L4PortSetServiceEntry",
                  "l4_protocol": proto,
-                 "destination_ports": [port_str],
+                 "destination_ports": sorted(port_strs, key=lambda p: int(p) if p.isdigit() else 0),
              }],
          })
     return f"/infra/services/{service_id}"
@@ -524,14 +710,22 @@ def _resolve_service(url: str, username: str, password: str,
 
 def create_policy(
     url: str, username: str, password: str,
-    run_id: str, rule_name: str, profile_path: str, group_path: str,
+    run_id: str, rule_name: str, profile_path: str, group_path: str = "",
     category: str = "EmergencyThreatRules", policy_name: str = "Virtual Patches",
     rule_action: str = "DETECT_PREVENT", nsx_version: str = "",
-    rule_tag: str = "", protocol: str = "", port: str = "",
+    rule_tag: str = "", protocol: str = "", ports: list = None,
+    group_paths: list = None,
 ) -> dict:
+    """Create or update one IDS rule in the Virtual Patches policy.
+
+    group_paths overrides group_path when provided — use it to pass multiple
+    destination groups (e.g. one per CVE) into a single rule.
+    """
     url = _clean_url(url)
     policy_id = "Virtual-Patches-Policy"
     sequence_number = 1
+
+    dest_groups = group_paths if group_paths else ([group_path] if group_path else ["ANY"])
 
     endpoint = f"{url}{POLICY}/infra/domains/default/intrusion-service-policies/{policy_id}"
     try:
@@ -542,26 +736,33 @@ def create_policy(
         rules = []
         method = "PUT"
 
-    if protocol and port:
-        service_path = _resolve_service(url, username, password, protocol, port)
+    if protocol and ports:
+        service_path = _resolve_service(url, username, password, protocol, ports)
         services = [service_path]
     else:
         services = ["ANY"]
 
-    # Stable rule ID derived from the profile so re-deploys update the same rule
-    rule_id = "rule-" + profile_path.split("/")[-1]
+    # Rule ID: keyed on port so one rule per port coexists in the policy.
+    # Use the first group path as a stable anchor, then append the port slug.
+    rule_id = "rule-" + dest_groups[0].split("/")[-1]
+    if ports:
+        try:
+            slug = "-".join(sorted(ports, key=int))
+        except (ValueError, TypeError):
+            slug = "-".join(sorted(str(p) for p in ports))
+        rule_id += f"-{(protocol or 'tcp').lower()}-{slug}"
 
     new_rule = {
         "id": rule_id,
         "display_name": rule_name,
         "ids_profiles": [profile_path],
         "source_groups": ["ANY"],
-        "destination_groups": [group_path],
+        "destination_groups": dest_groups,
         "services": services,
         "action": rule_action,
         "direction": "IN",
         "logged": True,
-        "scope": [group_path],
+        "scope": dest_groups,
     }
     if rule_tag:
         new_rule["tag"] = rule_tag

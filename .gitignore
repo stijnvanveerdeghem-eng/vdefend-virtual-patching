@@ -3,3 +3,4 @@ profiles_state.json
 __pycache__/
 *.pyc
 vdefend-virtual-patching-demo/
+nessus-mock-for-flowgen/

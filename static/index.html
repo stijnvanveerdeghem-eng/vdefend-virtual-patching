@@ -155,9 +155,12 @@
             </label>
           </div>
         </div>
-        <div class="mt-3 d-flex align-items-center gap-3">
+        <div class="mt-3 d-flex align-items-center gap-3 flex-wrap">
           <button class="btn btn-primary" id="btnNsxConnect" onclick="nsxConnectAndIndex()">
             <i class="bi bi-plug me-1"></i>Connect &amp; Index Signatures
+          </button>
+          <button class="btn btn-outline-primary" id="btnNsxSspConnect" onclick="nsxAndSspConnect()" style="display:none">
+            <i class="bi bi-plug me-1"></i>Connect NSX + SSP
           </button>
           <span id="nsxStatus" class="status-text"></span>
         </div>
@@ -172,6 +175,63 @@
         </div>
         <div id="coverageSummary" class="mt-3 d-none">
           <div class="row g-2" id="coverageCards"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── SSP Port Intelligence (optional) ── -->
+    <div class="card shadow-sm mb-3" id="sspCard">
+      <div class="card-header d-flex justify-content-between align-items-center py-2"
+           style="cursor:pointer" data-bs-toggle="collapse" data-bs-target="#sspCardBody" aria-expanded="false">
+        <span class="small"><i class="bi bi-activity me-2"></i>SSP Port Intelligence
+          <span class="badge bg-secondary ms-2 fw-normal">Optional</span>
+        </span>
+        <i class="bi bi-chevron-down text-muted" id="sspChevron"></i>
+      </div>
+      <div id="sspCardBody" class="collapse">
+        <div class="card-body pb-2">
+          <div class="row g-2 mb-2">
+            <div class="col-md-5">
+              <label class="form-label text-muted small mb-1">SSP URL</label>
+              <input id="sspUrl" type="text" class="form-control form-control-sm" value="https://ssp.far-away.galaxy" />
+            </div>
+            <div class="col-md-3">
+              <label class="form-label text-muted small mb-1">Username</label>
+              <input id="sspUser" type="text" class="form-control form-control-sm" value="admin" />
+            </div>
+            <div class="col-md-4">
+              <label class="form-label text-muted small mb-1">Password</label>
+              <input id="sspPass" type="password" class="form-control form-control-sm" placeholder="••••••••" />
+            </div>
+          </div>
+          <div class="d-flex align-items-center gap-3 mb-3 flex-wrap">
+            <div class="form-check mb-0">
+              <input class="form-check-input" type="checkbox" id="saveSspCreds">
+              <label class="form-check-label text-muted small" for="saveSspCreds">Save credentials</label>
+            </div>
+            <button class="btn btn-sm btn-primary" id="btnSspConnect" onclick="sspConnect()" disabled>
+              <i class="bi bi-plug me-1"></i>Connect to SSP
+            </button>
+            <span id="sspStatus" class="status-text"></span>
+          </div>
+          <!-- Time range + load (shown once connected) -->
+          <div id="sspQueryRow" class="d-flex align-items-center gap-2 flex-wrap mb-3 d-none">
+            <span class="text-muted small">Lookback:</span>
+            <div class="btn-group btn-group-sm" role="group">
+              <button class="btn btn-outline-secondary time-range-btn active" data-hours="24"   onclick="setTimeRange(this)">Day</button>
+              <button class="btn btn-outline-secondary time-range-btn"        data-hours="168"  onclick="setTimeRange(this)">Week</button>
+              <button class="btn btn-outline-secondary time-range-btn"        data-hours="720"  onclick="setTimeRange(this)">Month</button>
+            </div>
+            <button class="btn btn-sm btn-primary" id="btnLoadFlows" onclick="loadPortActivity()">
+              <i class="bi bi-activity me-1"></i>Load Port Activity
+            </button>
+            <button class="btn btn-sm btn-outline-primary d-none" id="btnApplyAll" onclick="applyAllSuggestions()">
+              <i class="bi bi-arrow-up-circle me-1"></i>Apply All
+            </button>
+            <span id="sspFlowStatus" class="status-text"></span>
+          </div>
+          <!-- Results -->
+          <div id="portSuggestionsArea" class="d-none"></div>
         </div>
       </div>
     </div>
@@ -196,11 +256,11 @@
           <div class="accordion mb-4" id="advancedConfigAccordion">
             <div class="accordion-item">
               <h2 class="accordion-header" id="headingAdvanced">
-                <button class="accordion-button collapsed" type="button" data-bs-toggle="collapse" data-bs-target="#collapseAdvanced" aria-expanded="false" aria-controls="collapseAdvanced">
+                <button class="accordion-button" type="button" data-bs-toggle="collapse" data-bs-target="#collapseAdvanced" aria-expanded="true" aria-controls="collapseAdvanced">
                   <i class="bi bi-sliders me-2"></i> Advanced Policy/Rule Config
                 </button>
               </h2>
-              <div id="collapseAdvanced" class="accordion-collapse collapse" aria-labelledby="headingAdvanced" data-bs-parent="#advancedConfigAccordion">
+              <div id="collapseAdvanced" class="accordion-collapse collapse show" aria-labelledby="headingAdvanced" data-bs-parent="#advancedConfigAccordion">
                 <div class="accordion-body">
                   <div class="row g-3">
                     <div class="col-md-6">
@@ -227,9 +287,31 @@
                       </select>
                     </div>
                     <div class="col-md-3">
-                      <label class="form-label text-muted small mb-1">Destination Port <span class="text-muted">(optional)</span></label>
-                      <input type="text" class="form-control form-control-sm" id="advPort" placeholder="">
+                      <label class="form-label text-muted small mb-1">Destination Port(s) <span class="text-muted">(optional)</span></label>
+                      <input type="text" class="form-control form-control-sm" id="advPort" placeholder="e.g. 80 or 80,443">
                     </div>
+                  </div>
+
+                  <!-- Per-host port overrides -->
+                  <div id="hostPortOverridesSection" class="d-none mt-3 pt-3 border-top">
+                    <div class="d-flex align-items-center justify-content-between mb-2">
+                      <span class="text-muted small">Per-Host Port Overrides <span class="text-muted fst-italic">(defaults from global above)</span></span>
+                      <button type="button" class="btn btn-sm btn-outline-secondary py-0" onclick="resetHostPorts()">
+                        <i class="bi bi-arrow-counterclockwise me-1"></i>Reset to global
+                      </button>
+                    </div>
+                    <table class="table table-sm align-middle mb-0">
+                      <thead class="table-light">
+                        <tr>
+                          <th class="small fw-normal text-muted">Host IP</th>
+                          <th class="small fw-normal text-muted" style="width:36px"></th>
+                          <th class="small fw-normal text-muted" style="width:130px">Protocol</th>
+                          <th class="small fw-normal text-muted" style="width:150px">Port(s)</th>
+                          <th class="small fw-normal text-muted" style="width:40px"></th>
+                        </tr>
+                      </thead>
+                      <tbody id="hostPortTableBody"></tbody>
+                    </table>
                   </div>
                 </div>
               </div>
@@ -267,6 +349,19 @@
     <div class="d-flex">
       <div class="toast-body" id="toastBody"></div>
       <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast"></button>
+    </div>
+  </div>
+</div>
+
+<!-- Port picker modal -->
+<div class="modal fade" id="portPickerModal" tabindex="-1" aria-labelledby="portPickerModalLabel" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header py-2">
+        <h6 class="modal-title mb-0" id="portPickerModalLabel">Observed Ports</h6>
+        <button type="button" class="btn-close btn-sm" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body py-2" id="portPickerModalBody"></div>
     </div>
   </div>
 </div>

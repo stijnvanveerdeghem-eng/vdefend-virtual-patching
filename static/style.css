@@ -268,3 +268,32 @@ body {
   background: #005bb5;
   border-color: #005bb5;
 }
+
+/* SSP card chevron rotation */
+#sspCardBody.show ~ * #sspChevron,
+#sspCard .card-header[aria-expanded="true"] #sspChevron {
+  transform: rotate(180deg);
+}
+#sspChevron { transition: transform 0.2s ease; }
+
+/* Port suggestion chips */
+.port-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid #dee2e6;
+  border-radius: 6px;
+  padding: 2px 8px 2px 8px;
+  font-size: 0.8rem;
+  background: #fff;
+}
+.port-chip .apply-btn {
+  background: none;
+  border: none;
+  padding: 0 2px;
+  cursor: pointer;
+  color: var(--vmw-blue);
+  font-size: 0.85rem;
+  line-height: 1;
+}
+.port-chip .apply-btn:hover { color: #005bb5; }

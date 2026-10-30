@@ -21,6 +21,7 @@ from urllib.parse import urlparse, parse_qs
 
 import nessus_client
 import nsx_client
+import ssp_client
 
 PORT = 5002
 STATIC_DIR = Path(__file__).parent / "static"
@@ -159,6 +160,28 @@ class Handler(BaseHTTPRequestHandler):
                 _state["last_sig_index"] = result
                 _ok(self, result)
 
+            elif path == "/api/nsx/app-ids":
+                result = nsx_client.get_app_id_index(
+                    body["nsx_url"], body["username"], body["password"]
+                )
+                _ok(self, {"app_ids": result})
+
+            elif path == "/api/ssp/connect":
+                result = ssp_client.connect(body["url"], body["username"], body["password"])
+                _state.update({
+                    "ssp_url": body["url"],
+                    "ssp_username": body["username"],
+                    "ssp_password": body["password"],
+                })
+                _ok(self, result)
+
+            elif path == "/api/ssp/flows":
+                results = ssp_client.query_port_activity(
+                    body["ssp_url"], body["username"], body["password"],
+                    body["host_ips"], int(body.get("lookback_hours", 24)),
+                )
+                _ok(self, {"results": results})
+
             elif path == "/api/deploy":
                 self._handle_deploy(body)
 
@@ -194,7 +217,8 @@ class Handler(BaseHTTPRequestHandler):
         category = body.get("category", "EmergencyThreatRules")
         rule_name = body.get("rule_name", f"VirtualPatch-Rule-{run_id}")
         rule_protocol = body.get("protocol", "")
-        rule_port = body.get("port", "")
+        # Accept "ports" (list) or legacy "port" (single string)
+        rule_ports = body.get("ports") or ([body["port"]] if body.get("port") else [])
 
         # Rule-level action only; signature default actions are left unchanged.
         rule_action = "DETECT" if action == "DETECT" else "DETECT_PREVENT"
@@ -206,33 +230,101 @@ class Handler(BaseHTTPRequestHandler):
             _err(self, "No IDPS signatures found for selected CVEs.")
             return
 
-        # Tag the VMs
-        tag_results = [nsx_client.tag_vm_by_ip(url, user, pwd, ip, cve_list) for ip in host_ips]
-        tagged = [r["ip"] for r in tag_results if r and r.get("tagged")]
-        not_found = [r["ip"] for r in tag_results if r and not r.get("tagged")]
+        # Build port groups first — determines single vs multi-port tagging strategy
+        host_port_list = body.get("host_ports", [])
+        if host_port_list:
+            pg: dict = {}
+            for hp in host_port_list:
+                key = (hp.get("protocol") or rule_protocol, hp.get("port") or "")
+                pg.setdefault(key, []).append(hp["ip"])
+            port_groups = list(pg.items())
+        else:
+            p = rule_ports[0] if len(rule_ports) == 1 else ""
+            port_groups = [((rule_protocol, p), host_ips)]
 
-        group_r   = nsx_client.create_group(url, user, pwd, run_id, cve_list)
+        # Well-known service label map for readable group names
+        _SVC_LABEL = {
+            ("TCP", "80"): "HTTP", ("TCP", "443"): "HTTPS",
+            ("TCP", "8080"): "HTTP-ALT", ("TCP", "8443"): "HTTPS-ALT",
+            ("TCP", "22"): "SSH", ("TCP", "3389"): "RDP",
+        }
+
+        # Tag the VMs.
+        # Each VM gets Vulnerability:CVE-xxx tags + one DestPort:TCPxxx tag per port.
+        # DestPort is the membership discriminator in NSX groups; VMFlowgen doesn't
+        # manage this scope so push_tags won't wipe it.
+        tagged = []
+        not_found = []
+        for (proto, port), grp_ips in port_groups:
+            pl = (proto or "TCP").upper()
+            pv = port if port else ""
+            dest_port_extras = [{"scope": "DestPort", "tag": f"{pl}{p.strip()}"}
+                                 for p in pv.split(",") if p.strip()] if pv else []
+            for ip in grp_ips:
+                r = nsx_client.tag_vm_by_ip(url, user, pwd, ip, cve_list,
+                                            extra_tags=dest_port_extras or None)
+                if r and r.get("tagged"):
+                    tagged.append(r["ip"])
+                else:
+                    not_found.append(r["ip"] if r else ip)
+
+        # Create one NSX group per (CVE × port) pair.
+        # Each group has a single flat AND expression: CVE-x AND DestPort|TCPxx.
+        # Groups are then gathered by port so each IDS rule references all CVE-groups
+        # for that port as its destination — 4 groups, 2 rules for VP05.
+        groups_map = {}  # key: (cve, proto, port)
+        for (proto, port), _ in port_groups:
+            pl = (proto or "TCP").upper()
+            pv = port if port else ""
+            svc = _SVC_LABEL.get((pl, pv), f"{pl}-{pv}" if pv else "")
+            for cve in cve_list:
+                grp_name = f"{cve.upper()}{('-' + svc) if svc else ''}"
+                groups_map[(cve, proto, port)] = nsx_client.create_group(
+                    url, user, pwd, run_id, [cve],
+                    group_name=grp_name, port=pv, proto=pl,
+                )
+        group_r = next(iter(groups_map.values()))
+
         profile_r = nsx_client.create_profile(
             url, user, pwd, run_id, profile_name, matched_cves,
             rule_action=rule_action, nsx_version=nsx_version,
         )
         rule_tag = "IDS-" + ",".join(cve_list)
-        policy_r  = nsx_client.create_policy(
-            url, user, pwd, run_id, rule_name,
-            profile_r["profile_path"], group_r["group_path"],
-            category, policy_name, rule_action,
-            nsx_version=nsx_version,
-            rule_tag=rule_tag,
-            protocol=rule_protocol,
-            port=rule_port,
-        )
+
+        # One IDS rule per port — destination_groups lists all CVE groups for that port.
+        all_rules = []
+        for (proto, port), _ in port_groups:
+            pl = (proto or "TCP").upper()
+            pv = port if port else ""
+            ports_for_rule = [pv] if pv else rule_ports
+            port_group_paths = [groups_map[(cve, proto, port)]["group_path"]
+                                 for cve in cve_list]
+            svc = _SVC_LABEL.get((pl, pv), f"{pl}-{pv}" if pv else "")
+            port_rule_name = f"{rule_name}-{svc}" if svc else rule_name
+            pr = nsx_client.create_policy(
+                url, user, pwd, run_id, port_rule_name,
+                profile_r["profile_path"],
+                category=category, policy_name=policy_name, rule_action=rule_action,
+                nsx_version=nsx_version,
+                rule_tag=rule_tag,
+                protocol=pl,
+                ports=ports_for_rule,
+                group_paths=port_group_paths,
+            )
+            all_rules.append(pr)
+
+        policy_r = all_rules[0]
+        all_rule_ids = ", ".join(r["rule_id"] for r in all_rules)
 
         _record_profile(profile_r["profile_id"], profile_name, cve_list, rule_action)
 
+        all_groups = list(groups_map.values())
         _ok(self, {
             "success": True,
             "run_id": run_id,
             **group_r, **profile_r, **policy_r,
+            "groups": [{"group_id": g["group_id"], "group_name": g["group_name"]} for g in all_groups],
+            "rule_id": all_rule_ids,
             "cves_covered": len(matched_cves),
             "hosts_protected": len(host_ips),
             "tagged": tagged,
